@@ -27,6 +27,15 @@ go.work.sum
 # env file
 .env
 
+# mise local overrides
+mise.local.toml
+
+# air hot-reload build output
+tmp/
+
+# Overmind socket
+.overmind.sock
+
 # Editor/IDE
 # .idea/
 # .vscode/
