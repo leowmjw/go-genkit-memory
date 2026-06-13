@@ -1,0 +1,29 @@
+# .air.toml — air hot-reload configuration
+# https://github.com/air-verse/air
+# Run directly:  air
+# Run via mise:  mise run dev  (which uses Overmind → air)
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+# Command to build the binary.
+# Adjust the main package path once a cmd/ entry point exists.
+cmd         = "go build -o ./tmp/main ./..."
+bin         = "./tmp/main"
+full_bin    = "./tmp/main"
+include_ext = ["go", "toml", "yaml", "env"]
+exclude_dir = ["tmp", "vendor", ".git", "testdata"]
+delay       = 1000   # milliseconds to wait before rebuilding after a change
+
+[log]
+time = true
+
+[color]
+main    = "magenta"
+watcher = "cyan"
+build   = "yellow"
+runner  = "green"
+
+[misc]
+clean_on_exit = true

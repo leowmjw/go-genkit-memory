@@ -1,6 +1,6 @@
 module github.com/leowmjw/go-genkit-memory
 
-go 1.25.0
+go 1.26
 
 require (
 	github.com/firebase/genkit/go v1.8.0
