@@ -7,6 +7,9 @@
 *.dll
 *.so
 *.dylib
+bin/
+# Binary itself
+demo
 
 # Test binary, built with `go test -c`
 *.test
@@ -37,5 +40,9 @@ tmp/
 .overmind.sock
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+
+# Ignore Direnv
+.envrc*
+

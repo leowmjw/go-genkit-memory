@@ -530,3 +530,58 @@ func TestAllStores_IsolationBetweenSessions(t *testing.T) {
 		})
 	}
 }
+
+// TestAllStores_TimestampOverflow verifies that Year-2100+ Unix epoch values
+// stored in session state survive JSON serialization without integer overflow
+// or truncation. Covers Scenario 22 from SCENARIO.md.
+func TestAllStores_TimestampOverflow(t *testing.T) {
+	// year2100 is 2100-01-01T00:00:00Z as a Unix epoch.
+	year2100 := int64(4102444800)
+
+	for _, ns := range allStores(t) {
+		ns := ns
+		t.Run(ns.name, func(t *testing.T) {
+			t.Parallel()
+			defer ns.close()
+			ctx := context.Background()
+
+			// Store a session containing large future timestamps.
+			d := &session.Data[ConversationState]{
+				ID: "ts-overflow-1",
+				State: ConversationState{
+					UserID: "timestamp-test",
+					Messages: []Message{
+						{Role: "user", Content: fmt.Sprintf("epoch:%d", year2100), Turn: int(year2100)},
+						{Role: "assistant", Content: fmt.Sprintf("epoch:%d", year2100+86400*365), Turn: int(year2100 + 1)},
+						{Role: "user", Content: "max-reasonable", Turn: int(9999999999)},
+					},
+				},
+			}
+			if err := ns.store.Save(ctx, d.ID, d); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+
+			got, err := ns.store.Get(ctx, d.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got == nil {
+				t.Fatal("expected data, got nil")
+			}
+			if len(got.State.Messages) != 3 {
+				t.Fatalf("Messages: want 3, got %d", len(got.State.Messages))
+			}
+
+			// Verify the Year-2100 epoch survived the round-trip.
+			wantTurn := int(year2100)
+			if got.State.Messages[0].Turn != wantTurn {
+				t.Errorf("Turn[0]: want %d, got %d (overflow?)", wantTurn, got.State.Messages[0].Turn)
+			}
+
+			// Verify the max-reasonable epoch (Year 2286) survived.
+			if got.State.Messages[2].Content != "max-reasonable" {
+				t.Errorf("Content[2]: want 'max-reasonable', got %q", got.State.Messages[2].Content)
+			}
+		})
+	}
+}

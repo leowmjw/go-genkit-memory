@@ -8,8 +8,7 @@ tmp_dir = "tmp"
 
 [build]
 # Command to build the binary.
-# Adjust the main package path once a cmd/ entry point exists.
-cmd         = "go build -o ./tmp/main ./..."
+cmd         = "go build -o ./tmp/main ./cmd/demo"
 bin         = "./tmp/main"
 full_bin    = "./tmp/main"
 include_ext = ["go", "toml", "yaml", "env"]

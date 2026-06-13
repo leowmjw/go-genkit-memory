@@ -1,7 +1,11 @@
 # AGENTS.md — Implementation Guide for go-genkit-memory
 
 This document is the authoritative specification for all implementation agents
-working on this repository.  Read it completely before writing any code.
+working on this repository.  Read it completely before writing any code. If there are any inconsistencies; point them out and ask to rsolve it first.
+
+Overall vision can be found in the file PRD.md
+
+Evaluation of correctness will be via scenarios in the file SCENARIO.md
 
 ---
 
@@ -13,9 +17,11 @@ All local tooling is managed through **[mise](https://mise.jdx.dev/)**.
 Configuration lives in `mise.toml` at the repository root.
 
 ```
-mise install          # install all declared tool versions
+mise install          # install all declared tool versions (go, node)
+mise run install      # install Go tools (air) + TencentDB gateway (npm)
+mise run tencentdb:install  # install TencentDB gateway only
 mise run doctor       # verify all runtime dependencies (see §1.4)
-mise run dev          # start the app via Overmind in dev mode
+mise run dev          # start the app via Overmind in dev mode (app + tencentdb)
 mise run test         # run unit tests only (no external deps)
 mise run test:int     # run integration tests (no external deps)
 mise run build        # compile the binary
@@ -46,10 +52,14 @@ Checks performed (in order):
 
 | Dependency | Minimum version | Install hint |
 |---|---|---|
-| `go` | 1.26 | `mise use go@latest` |
-| `air` | latest | `go install github.com/air-verse/air@latest` |
-| `overmind` | latest | `brew install overmind` / `go install github.com/DarthSim/overmind/v2@latest` |
+| `go` | 1.26 | `mise install` |
+| `air` | latest | `mise run install` |
 | `tmux` | any | system package manager |
+| `overmind` | latest | `brew install overmind` / `go install github.com/DarthSim/overmind/v2@latest` |
+| `node` | 22.16 | `mise install` (declared in `[tools]`) |
+| `npm` | ships with node | `mise install` |
+| TencentDB gateway plugin dir | `~/.memory-tencentdb/tdai-memory-openclaw-plugin` | `mise run tencentdb:install` |
+| TencentDB gateway daemon | reachable at `$MEMORY_TENCENTDB_GATEWAY_HOST:$MEMORY_TENCENTDB_GATEWAY_PORT` | `mise run dev` or `mise run tencentdb:start` |
 | OpenAI-compatible endpoint | reachable at `$OPENAI_BASE_URL` | start Ollama or compatible server |
 
 The doctor task exits **0** only when all checks pass.  Each failing check
@@ -64,11 +74,16 @@ All environment configuration is declared in `mise.toml` under `[env]`.
 
 | Variable | Default in mise.toml | Purpose |
 |---|---|---|
-| `OPENAI_BASE_URL` | `http://aibox:11435/v1` | OpenAI-compatible API base URL |
+| `OPENAI_BASE_URL` | `http://aibox:11435/v1` | OpenAI-compatible API base URL (Go app) |
 | `OPENAI_API_KEY` | `local` | API key (arbitrary value for local servers) |
-| `OPENAI_MODEL` | `gpt-oss` | Default model name |
+| `OPENAI_MODEL` | `gpt-oss-20b-Q8_0` | Default model name |
 | `APP_ENV` | `development` | Runtime environment tag |
 | `LOG_LEVEL` | `debug` | Structured log verbosity |
+| `MEMORY_TENCENTDB_GATEWAY_HOST` | `127.0.0.1` | TencentDB gateway host |
+| `MEMORY_TENCENTDB_GATEWAY_PORT` | `8420` | TencentDB gateway port |
+| `MEMORY_TENCENTDB_LLM_API_KEY` | `local` | API key forwarded to the gateway sidecar |
+| `MEMORY_TENCENTDB_LLM_BASE_URL` | `http://aibox:11435/v1` | LLM base URL forwarded to the gateway sidecar |
+| `MEMORY_TENCENTDB_LLM_MODEL` | `gpt-oss-20b-Q8_0` | Model forwarded to the gateway sidecar |
 
 Override any variable in a `.env` file (`.gitignore`d) or via `mise.local.toml`
 for machine-specific values.
@@ -177,6 +192,7 @@ if os.Getenv("INTEGRATION_LIVE") != "1" {
 ```
 mise run test        # go test ./session/... -race -count=1
 mise run test:int    # go test ./integration/... -race -count=1 -timeout 120s
+mise run test:all    # go test ./... -race -count=1 -timeout 120s
 ```
 
 ---
@@ -186,14 +202,37 @@ mise run test:int    # go test ./integration/... -race -count=1 -timeout 120s
 ```
 .
 ├── AGENTS.md            ← this file
-├── Procfile             ← Overmind process definitions
-├── mise.toml            ← tool versions, env vars, tasks
+├── Procfile             ← Overmind process definitions (app + tencentdb)
+├── mise.toml            ← tool versions (go, node), env vars, tasks
 ├── .air.toml            ← air hot-reload config
 ├── go.mod / go.sum
 ├── README.md
+├── cmd/
+│   └── demo/            ← runnable demo binary (makes air/Overmind functional)
+│       └── main.go
+├── memory/              ← TencentDB memory adapter (core PRD deliverable)
+│   ├── adapter.go       ← session.Store[S] impl wrapping gateway + disk store
+│   ├── client.go        ← HTTP client for gateway (5 s timeout, circuit breaker)
+│   ├── pipeline.go      ← L0→L1→L2→L3 type definitions
+│   ├── offload.go       ← large-payload extraction to refs/*.md
+│   ├── fallback.go      ← in-process ring-buffer cache on daemon unreachable
+│   ├── sanitize.go      ← input validation (role, UTF-8, JSON depth, token length)
+│   └── adapter_test.go  ← unit tests (function-variable seams, no live daemon)
 ├── session/
 │   ├── bbolt/           ← BBolt-backed session store
 │   └── sqlite/          ← SQLite-backed session store
+├── examples/            ← runnable scenario proofs (INTEGRATION_LIVE=1)
+│   ├── scenario01_debugging/
+│   ├── scenario02_longterm/
+│   ├── scenario03_concurrent/
+│   ├── scenario04_degradation/
+│   ├── scenario05_large_payload/
+│   ├── scenario06_sliding_window/
+│   ├── scenario13_isolation/
+│   ├── scenario14_sanitize/
+│   ├── scenario19_timeout/
+│   ├── scenario22_timestamps/
+│   └── scenario24_cold_start/
 └── integration/         ← cross-store integration tests
 ```
 
@@ -245,3 +284,8 @@ unless the repository ships a runnable binary; in that case use `cmd/<name>/main
 - [ ] New code uses `slog` for logging, not `fmt.Print*` or `log.Print*`.
 - [ ] Every new exported symbol has a Go doc comment.
 - [ ] `.env` / secrets are not committed (scan with `mise run secret-scan`).
+
+NOTE: Check the TencentDB is started to run via Overmind + Procfile too 
+
+Evaluation of correctness should be designed to fit and pass all the scenarios in SCENARIO.md; ensure the examples created in the folder examples natch this, the result should be mostly deterministic and be accurate. Ask if not clear.
+
