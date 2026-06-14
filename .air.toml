@@ -12,7 +12,16 @@ cmd         = "go build -o ./tmp/main ./cmd/demo"
 bin         = "./tmp/main"
 full_bin    = "./tmp/main"
 include_ext = ["go", "toml", "yaml", "env"]
-exclude_dir = ["tmp", "vendor", ".git", "testdata"]
+exclude_dir = [
+  "tmp", "vendor", ".git", "testdata",
+  "node_modules",                   # JS deps — from .gitignore
+  ".memory-tencentdb",              # TencentDB gateway install dir
+  "bin",                            # compiled binaries — from .gitignore
+#  "integration",                    # integration tests don't trigger rebuilds
+#  "examples",                       # standalone programs, not part of the daemon
+]
+exclude_file   = []
+exclude_regex  = ["_test\\.go$", "\\.pb\\.go$"]
 delay       = 1000   # milliseconds to wait before rebuilding after a change
 
 [log]

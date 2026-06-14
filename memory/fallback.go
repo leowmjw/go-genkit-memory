@@ -9,9 +9,10 @@ const defaultFallbackCapacity = 1000
 
 // captureEntry is a buffered L0 capture that could not reach the gateway.
 type captureEntry struct {
-	SessionKey string
-	Messages   []Message
-	CapturedAt time.Time
+	SessionKey       string
+	UserContent      string
+	AssistantContent string
+	CapturedAt       time.Time
 }
 
 // fallbackCache is a bounded ring buffer that holds capture events that failed

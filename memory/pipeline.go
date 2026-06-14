@@ -15,12 +15,14 @@ const (
 )
 
 // CaptureRequest is the body sent to POST /capture.
+// Fields match the gateway's required schema exactly.
 type CaptureRequest struct {
-	SessionKey string    `json:"session_key"`
-	Messages   []Message `json:"messages"`
+	SessionKey       string `json:"session_key"`
+	UserContent      string `json:"user_content"`
+	AssistantContent string `json:"assistant_content"`
 }
 
-// Message is a single conversational turn entry.
+// Message is a single conversational turn entry used internally.
 type Message struct {
 	Role    string `json:"role"`    // "user" | "assistant" | "system"
 	Content string `json:"content"`

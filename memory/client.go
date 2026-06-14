@@ -122,10 +122,12 @@ func (c *gatewayClient) post(ctx context.Context, path string, body, v any) erro
 	}
 
 	c.recordSuccess()
-	c.log.Debug("gateway call",
-		slog.String("path", path),
-		slog.Duration("latency", time.Since(start)),
-	)
+	if lat := time.Since(start); lat > 500*time.Millisecond {
+		c.log.Debug("gateway call slow",
+			slog.String("path", path),
+			slog.Duration("latency", lat),
+		)
+	}
 	return nil
 }
 

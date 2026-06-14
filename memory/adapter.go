@@ -75,6 +75,13 @@ func WithTokenBudget(chars int) Option {
 	return func(o *adapterOptions) { o.tokenBudget = chars }
 }
 
+// WithMaxRecallTokens sets the maximum number of LLM tokens allowed in a
+// recall response. The adapter trims the context to fit this budget using a
+// conservative 4-chars-per-token heuristic.
+func WithMaxRecallTokens(tokens int) Option {
+	return func(o *adapterOptions) { o.tokenBudget = tokens * 4 }
+}
+
 // WithFallbackCapacity sets the ring-buffer capacity for the in-process
 // fallback cache. Defaults to 1000 entries.
 func WithFallbackCapacity(n int) Option {
@@ -211,18 +218,17 @@ func (a *Adapter[S]) Capture(ctx context.Context, sessionID, userMsg, assistantM
 	}
 
 	req := CaptureRequest{
-		SessionKey: sessionID,
-		Messages: []Message{
-			{Role: "user", Content: userMsg},
-			{Role: "assistant", Content: assistantMsg},
-		},
+		SessionKey:       sessionID,
+		UserContent:      userMsg,
+		AssistantContent: assistantMsg,
 	}
 
 	onFailure := func(err error) {
 		a.fb.Add(captureEntry{
-			SessionKey: sessionID,
-			Messages:   req.Messages,
-			CapturedAt: time.Now(),
+			SessionKey:       sessionID,
+			UserContent:      req.UserContent,
+			AssistantContent: req.AssistantContent,
+			CapturedAt:       time.Now(),
 		})
 		a.log.Warn("capture queued to fallback buffer",
 			slog.String("session", sessionID),

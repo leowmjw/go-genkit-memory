@@ -3,7 +3,7 @@
 
 [tools]
 go   = "1.26"
-node = "22.16"   # required for npx tsx (TencentDB gateway); npm/npx ship with node
+node = "26"      # required for npx tsx (TencentDB gateway); npm/npx ship with node
 # air is installed via go install (see tasks.install below)
 # overmind is a native binary; install via brew or go install
 
@@ -23,6 +23,10 @@ GOFLAGS = "-mod=readonly"
 # TencentDB memory gateway location
 MEMORY_TENCENTDB_GATEWAY_HOST = "127.0.0.1"
 MEMORY_TENCENTDB_GATEWAY_PORT = "8420"
+
+# Disable gateway file logging in dev — default /data/log/ is not writable on macOS.
+# Set to a writable path (e.g. "/tmp/tdai-logs/") to enable file logging.
+LOG_PATH = ""
 
 # LLM credentials forwarded to the TencentDB Node.js gateway sidecar
 # The gateway reads MEMORY_TENCENTDB_LLM_* (not OPENAI_*).
@@ -48,23 +52,75 @@ description = "Download and install the TencentDB memory gateway (Node.js)"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
+
+# All npm work happens under $HOME/.memory-tencentdb — NEVER in the repo directory.
+# A system mktemp dir is used for the download stage so no npm artefacts
+# (package.json, package-lock.json, node_modules) are left in the workspace.
 PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
 if [ -d "$PLUGIN_DIR" ]; then
   echo "TencentDB gateway already installed at $PLUGIN_DIR"
   exit 0
 fi
+
 echo "Installing @tencentdb-agent-memory/memory-tencentdb …"
 mkdir -p "$HOME/.memory-tencentdb"
-TEMP_DIR=$(mktemp -d)
+
+# Stage 1 — download into a system temp dir, then copy to final location.
+TEMP_DIR=$(mktemp -d /tmp/tdai-install-XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
-cd "$TEMP_DIR"
-npm init -y --silent
-npm install @tencentdb-agent-memory/memory-tencentdb@latest --omit=dev --silent
+cd "$TEMP_DIR"   # explicitly in /tmp — not the repo
+
+# package.json overrides fix broken transitive dep version ranges:
+#  • @opentelemetry/api-logs ^0.218.0 locks minor in 0.x semver so 0.219.x is
+#    out of range — widen to >=0.218.0.
+#  • zod v3/v4 peer-dep split in @ai-sdk/openai — widen to >=3.25.0.
+node - <<'JSEOF'
+const fs = require('fs');
+fs.writeFileSync('package.json', JSON.stringify({
+  name: 'tdai-install', private: true,
+  overrides: { '@opentelemetry/api-logs': '>=0.218.0', 'zod': '>=3.25.0' }
+}, null, 2));
+JSEOF
+
+npm install @tencentdb-agent-memory/memory-tencentdb@latest \
+  --omit=dev --legacy-peer-deps --silent
 cp -r node_modules/@tencentdb-agent-memory/memory-tencentdb "$PLUGIN_DIR"
+
+# Stage 2 — install the plugin's own runtime deps inside $HOME (not /tmp, not the repo).
+# tsx ships as a direct dep in the package — no separate install needed.
+# Widen direct dep version ranges in-place (npm EOVERRIDE rejects overrides on direct deps).
 cd "$PLUGIN_DIR"
-npm install --omit=dev --silent
-npm install tsx --silent
+node - <<'JSEOF'
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const widen = { '@opentelemetry/api-logs': '>=0.218.0', 'zod': '>=3.25.0' };
+for (const [name, range] of Object.entries(widen)) {
+  if (pkg.dependencies?.[name])     pkg.dependencies[name] = range;
+  if (pkg.devDependencies?.[name])  pkg.devDependencies[name] = range;
+  if (pkg.peerDependencies?.[name]) pkg.peerDependencies[name] = range;
+}
+delete pkg.overrides;
+fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+JSEOF
+
+npm install --omit=dev --legacy-peer-deps --silent
 echo "TencentDB gateway installed at $PLUGIN_DIR"
+"""
+
+[tasks."tencentdb:upgrade"]
+description = "Upgrade the TencentDB memory gateway to the latest published version"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Remove the existing install and re-run tencentdb:install.
+# All temp work happens in /tmp — the repo directory is never touched.
+PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
+if [ -d "$PLUGIN_DIR" ]; then
+  echo "Removing existing gateway at $PLUGIN_DIR …"
+  rm -rf "$PLUGIN_DIR"
+fi
+mise run tencentdb:install
 """
 
 [tasks."tencentdb:start"]

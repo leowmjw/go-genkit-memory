@@ -46,3 +46,9 @@ tmp/
 # Ignore Direnv
 .envrc*
 
+node_modules
+
+# Guard against accidental npm runs in the workspace root
+package.json
+package-lock.json
+yarn.lock
