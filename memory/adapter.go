@@ -11,37 +11,33 @@ import (
 	"github.com/firebase/genkit/go/core/x/session"
 )
 
-// defaultGatewayURL is used when MEMORY_TENCENTDB_GATEWAY_HOST/PORT are not set
-// via options.
-const defaultGatewayURL = "http://127.0.0.1:8420"
-
 // defaultTokenBudget is the maximum number of characters returned by Recall.
 // 0 means no limit.
 const defaultTokenBudget = 0
 
-// Adapter wraps any [session.Store] and layers the TencentDB memory gateway
+// Adapter wraps any [session.Store] and layers the 4-tier memory pipeline
 // on top for long-term memory. It is safe for concurrent use.
 //
 // The adapter implements [session.Store] so it is a drop-in replacement
 // wherever a store is accepted (session.New, session.Load, etc.).
 //
 // Additionally it exposes:
-//   - [Adapter.Capture]: asynchronous L0 turn capture sent to the gateway.
-//   - [Adapter.Recall]: synchronous L1–L3 context retrieval from the gateway.
+//   - [Adapter.Capture]: L0 turn capture feeding the local pipeline (L0→L3).
+//   - [Adapter.Recall]: L1–L3 context retrieval from the local memory store.
 //   - [Adapter.EndSession]: flush pending pipeline work on session end.
 type Adapter[S any] struct {
-	store   session.Store[S]
-	client  *gatewayClient
-	fb      *fallbackCache
-	off     *offloader
-	log     *slog.Logger
-	budget  int
+	store    session.Store[S]
+	pipeline *PipelineManager
+	fb       *fallbackCache
+	off      *offloader
+	log      *slog.Logger
+	budget   int
 }
 
 // adapterOptions collects functional options.
 type adapterOptions struct {
-	gatewayURL  string
-	apiKey      string
+	pipelineCfg PipelineConfig
+	memStore    MemoryStore
 	refsDir     string
 	tokenBudget int
 	fbCapacity  int
@@ -51,20 +47,19 @@ type adapterOptions struct {
 // Option configures an Adapter.
 type Option func(*adapterOptions)
 
-// WithGatewayURL sets the base URL of the TencentDB memory gateway.
-// Defaults to http://127.0.0.1:8420.
-func WithGatewayURL(url string) Option {
-	return func(o *adapterOptions) { o.gatewayURL = url }
+// WithPipelineConfig sets the pipeline configuration for local processing.
+func WithPipelineConfig(cfg PipelineConfig) Option {
+	return func(o *adapterOptions) { o.pipelineCfg = cfg }
 }
 
-// WithAPIKey sets the bearer token used to authenticate with the gateway.
-// Leave empty for unauthenticated local deployments.
-func WithAPIKey(key string) Option {
-	return func(o *adapterOptions) { o.apiKey = key }
+// WithMemoryStore sets the memory store used by the pipeline.
+// If not set, an in-memory store is used (data lost on restart).
+func WithMemoryStore(store MemoryStore) Option {
+	return func(o *adapterOptions) { o.memStore = store }
 }
 
 // WithRefsDir sets the directory where large payloads are offloaded.
-// Defaults to ~/.memory-tencentdb/memory-tdai/refs.
+// Defaults to <DataDir>/refs.
 func WithRefsDir(dir string) Option {
 	return func(o *adapterOptions) { o.refsDir = dir }
 }
@@ -94,14 +89,14 @@ func WithLogger(l *slog.Logger) Option {
 	return func(o *adapterOptions) { o.logger = l }
 }
 
-// NewAdapter wraps store with the TencentDB memory adapter.
+// NewAdapter wraps store with the local 4-tier memory pipeline.
 //
-// The adapter reads MEMORY_TENCENTDB_GATEWAY_HOST and
-// MEMORY_TENCENTDB_GATEWAY_PORT from the environment to locate the gateway,
-// and MEMORY_TENCENTDB_GATEWAY_API_KEY for auth. These can be overridden with
-// options.
+// The adapter processes conversation turns through L0→L3 in-process using
+// an OpenAI-compatible LLM endpoint configured via environment variables
+// (OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL) or via WithPipelineConfig.
 func NewAdapter[S any](store session.Store[S], opts ...Option) *Adapter[S] {
 	o := &adapterOptions{
+		pipelineCfg: PipelineConfigFromEnv(),
 		tokenBudget: defaultTokenBudget,
 		fbCapacity:  defaultFallbackCapacity,
 	}
@@ -109,26 +104,12 @@ func NewAdapter[S any](store session.Store[S], opts ...Option) *Adapter[S] {
 		opt(o)
 	}
 
-	// Resolve gateway URL from env if not set via option.
-	if o.gatewayURL == "" {
-		host := os.Getenv("MEMORY_TENCENTDB_GATEWAY_HOST")
-		port := os.Getenv("MEMORY_TENCENTDB_GATEWAY_PORT")
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		if port == "" {
-			port = "8420"
-		}
-		o.gatewayURL = fmt.Sprintf("http://%s:%s", host, port)
-	}
-
-	if o.apiKey == "" {
-		o.apiKey = os.Getenv("MEMORY_TENCENTDB_GATEWAY_API_KEY")
+	if o.memStore == nil {
+		o.memStore = NewInMemoryStore()
 	}
 
 	if o.refsDir == "" {
-		home, _ := os.UserHomeDir()
-		o.refsDir = filepath.Join(home, ".memory-tencentdb", "memory-tdai", "refs")
+		o.refsDir = filepath.Join(o.pipelineCfg.DataDir, "refs")
 	}
 
 	if o.logger == nil {
@@ -137,13 +118,15 @@ func NewAdapter[S any](store session.Store[S], opts ...Option) *Adapter[S] {
 		}))
 	}
 
+	pipeline := NewPipelineManager(o.pipelineCfg, o.memStore, o.logger)
+
 	return &Adapter[S]{
-		store:  store,
-		client: newGatewayClient(o.gatewayURL, o.apiKey, o.logger),
-		fb:     newFallbackCache(o.fbCapacity),
-		off:    newOffloader(o.refsDir, o.logger),
-		log:    o.logger,
-		budget: o.tokenBudget,
+		store:    store,
+		pipeline: pipeline,
+		fb:       newFallbackCache(o.fbCapacity),
+		off:      newOffloader(o.refsDir, o.logger),
+		log:      o.logger,
+		budget:   o.tokenBudget,
 	}
 }
 
@@ -154,7 +137,7 @@ func (a *Adapter[S]) Get(ctx context.Context, sessionID string) (*session.Data[S
 
 // Save persists session data to the underlying store.
 // It does NOT automatically fire L0 capture — call [Adapter.Capture] explicitly
-// after each conversation turn to route data to the gateway.
+// after each conversation turn to feed the pipeline.
 func (a *Adapter[S]) Save(ctx context.Context, sessionID string, data *session.Data[S]) error {
 	return a.store.Save(ctx, sessionID, data)
 }
@@ -173,10 +156,9 @@ func (a *Adapter[S]) Delete(ctx context.Context, sessionID string) error {
 
 // Close flushes pending pipeline work and releases resources.
 func (a *Adapter[S]) Close() error {
-	// Best-effort: flush all sessions with buffered captures.
-	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = a.client.EndSession(drainCtx, "")
+	if err := a.pipeline.Close(); err != nil {
+		a.log.Warn("pipeline close error", slog.String("err", err.Error()))
+	}
 
 	type closer interface {
 		Close() error
@@ -187,14 +169,13 @@ func (a *Adapter[S]) Close() error {
 	return nil
 }
 
-// Capture asynchronously sends a conversation turn to the gateway for L0
-// capture and subsequent pipeline processing (L1→L3).
+// Capture processes a conversation turn through the local pipeline (L0→L3).
 //
 // userMsg and assistantMsg are sanitized (role validation, UTF-8 repair,
-// zero-delimiter guard) before dispatch. Large messages exceeding 50 KB are
+// zero-delimiter guard) before processing. Large messages exceeding 50 KB are
 // offloaded to refs/*.md and replaced with path pointers.
 //
-// If the gateway is unavailable the turn is buffered in the in-process
+// If pipeline processing fails, the turn is buffered in the in-process
 // fallback ring buffer and a non-fatal error is returned.
 func (a *Adapter[S]) Capture(ctx context.Context, sessionID, userMsg, assistantMsg string) error {
 	// Sanitize inputs.
@@ -217,51 +198,56 @@ func (a *Adapter[S]) Capture(ctx context.Context, sessionID, userMsg, assistantM
 		a.log.Warn("offload failed", slog.String("err", err.Error()))
 	}
 
-	req := CaptureRequest{
-		SessionKey:       sessionID,
-		UserContent:      userMsg,
-		AssistantContent: assistantMsg,
+	// Build conversation messages for the pipeline.
+	now := time.Now()
+	messages := []ConversationMessage{
+		{
+			ID:        generateID(),
+			Role:      "user",
+			Content:   userMsg,
+			Timestamp: now.Add(-time.Millisecond), // user slightly before assistant
+			SessionID: sessionID,
+		},
+		{
+			ID:        generateID(),
+			Role:      "assistant",
+			Content:   assistantMsg,
+			Timestamp: now,
+			SessionID: sessionID,
+		},
 	}
 
-	onFailure := func(err error) {
+	// Feed the local pipeline.
+	if err := a.pipeline.Capture(ctx, sessionID, messages); err != nil {
 		a.fb.Add(captureEntry{
 			SessionKey:       sessionID,
-			UserContent:      req.UserContent,
-			AssistantContent: req.AssistantContent,
-			CapturedAt:       time.Now(),
+			UserContent:      userMsg,
+			AssistantContent: assistantMsg,
+			CapturedAt:       now,
 		})
-		a.log.Warn("capture queued to fallback buffer",
+		a.log.Warn("pipeline capture failed, buffered",
 			slog.String("session", sessionID),
 			slog.Int("buffered", a.fb.Len()),
 			slog.String("err", err.Error()),
 		)
-	}
-
-	if err := a.client.Capture(ctx, req, onFailure); err != nil {
-		return fmt.Errorf("memory.Capture: gateway unavailable (buffered): %w", err)
+		return fmt.Errorf("memory.Capture: pipeline error (buffered): %w", err)
 	}
 	return nil
 }
 
-// Recall queries the gateway for enriched L1–L3 historical context.
+// Recall queries the local pipeline for enriched L1–L3 historical context.
 //
 // The returned string is ready to be prepended to the LLM context. It is
 // trimmed to the configured token budget (if any). An empty string is returned
-// when no relevant history exists or the gateway is unavailable (graceful
-// degradation — the caller's generation loop must not be interrupted).
+// when no relevant history exists (graceful degradation — the caller's
+// generation loop must not be interrupted).
 func (a *Adapter[S]) Recall(ctx context.Context, sessionID, query string) (string, error) {
 	query, err := SanitizeContent(query)
 	if err != nil {
 		return "", fmt.Errorf("memory.Recall: sanitize query: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, gatewayTimeout)
-	defer cancel()
-
-	text, err := a.client.Recall(ctx, RecallRequest{
-		SessionKey: sessionID,
-		Query:      query,
-	})
+	text, err := a.pipeline.Recall(ctx, sessionID, query)
 	if err != nil {
 		a.log.Warn("recall failed, continuing without context",
 			slog.String("session", sessionID),
@@ -278,18 +264,20 @@ func (a *Adapter[S]) Recall(ctx context.Context, sessionID, query string) (strin
 
 // EndSession flushes pending pipeline work for the given session.
 // Call this when a session is definitively complete (e.g. on logout).
-func (a *Adapter[S]) EndSession(ctx context.Context, sessionID string) error {
-	return a.client.EndSession(ctx, sessionID)
+func (a *Adapter[S]) EndSession(_ context.Context, _ string) error {
+	// In local mode, pipeline processing is synchronous.
+	// Nothing to flush, but keep the API for compatibility.
+	return nil
 }
 
 // FallbackLen returns the number of capture events currently buffered in the
-// fallback ring buffer (i.e. events that could not reach the gateway).
+// fallback ring buffer (i.e. events that could not be processed by the pipeline).
 func (a *Adapter[S]) FallbackLen() int {
 	return a.fb.Len()
 }
 
 // DrainFallback returns all buffered capture events and clears the buffer.
-// Use this to re-deliver events once the gateway recovers.
+// Use this to re-process events after resolving pipeline issues.
 func (a *Adapter[S]) DrainFallback() []captureEntry {
 	return a.fb.DrainAll()
 }

@@ -33,10 +33,10 @@ func main() {
 		{"superuser", "user"},
 		{"system_admin", "user"},
 		{"<script>alert(1)</script>", "user"},
-		{"user", "user"},       // valid — should pass through
+		{"user", "user"},           // valid — should pass through
 		{"assistant", "assistant"}, // valid
-		{"system", "system"},   // valid
-		{"", "user"},           // empty → default
+		{"system", "system"},       // valid
+		{"", "user"},               // empty → default
 	}
 
 	var failures int

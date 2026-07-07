@@ -1,6 +1,10 @@
 package memory
 
-import "time"
+import (
+	"os"
+	"path/filepath"
+	"time"
+)
 
 // MemoryType classifies an extracted L1 memory record.
 type MemoryType string
@@ -14,10 +18,20 @@ const (
 	MemoryTypeInstruction MemoryType = "instruction"
 )
 
+// EmbeddingProvider selects between embedding backends.
+type EmbeddingProvider string
+
+const (
+	// EmbeddingProviderOpenAI uses an OpenAI-compatible HTTP embedding endpoint.
+	EmbeddingProviderOpenAI EmbeddingProvider = "openai"
+	// EmbeddingProviderONNX uses a local in-process ONNX model for embeddings.
+	EmbeddingProviderONNX EmbeddingProvider = "onnx"
+)
+
 // ConversationMessage is a single turn in a conversation used as L0 input.
 type ConversationMessage struct {
 	ID        string    `json:"id"`
-	Role      string    `json:"role"`    // "user" | "assistant" | "system"
+	Role      string    `json:"role"` // "user" | "assistant" | "system"
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 	SessionID string    `json:"session_id"`
@@ -74,6 +88,13 @@ const (
 	DedupSkip DedupAction = "skip"
 )
 
+// L1SearchResult is a result from vector or FTS search.
+type L1SearchResult struct {
+	Record    MemoryRecord `json:"record"`
+	Score     float64      `json:"score"`
+	MatchType string       `json:"match_type"` // "vector" | "fts"
+}
+
 // SceneBlock is an L2 scene containing grouped memories with metadata.
 type SceneBlock struct {
 	Name      string    `json:"name"`
@@ -99,16 +120,17 @@ const (
 
 // PersonaProfile is the L3 synthesized user persona.
 type PersonaProfile struct {
-	Content      string    `json:"content"`
-	CharCount    int       `json:"char_count"`
-	GeneratedAt  time.Time `json:"generated_at"`
-	SceneCount   int       `json:"scene_count"`
-	IsIncremental bool     `json:"is_incremental"`
+	Content       string    `json:"content"`
+	CharCount     int       `json:"char_count"`
+	GeneratedAt   time.Time `json:"generated_at"`
+	SceneCount    int       `json:"scene_count"`
+	IsIncremental bool      `json:"is_incremental"`
 }
 
 // PipelineConfig holds all configuration for the local pipeline.
 type PipelineConfig struct {
 	// DataDir is the base directory for pipeline state (JSONL, scenes, persona).
+	// Defaults to ".memory" in the current working directory.
 	DataDir string
 
 	// LLM configuration for pipeline processing.
@@ -143,21 +165,31 @@ type LLMConfig struct {
 
 // EmbeddingConfig holds configuration for the embedding service.
 type EmbeddingConfig struct {
+	// Provider selects between "openai" (HTTP API) and "onnx" (local in-process).
+	Provider   EmbeddingProvider
 	BaseURL    string
 	APIKey     string
 	Model      string
 	Dimensions int
 	Timeout    time.Duration
+	// ONNXModelPath is the filesystem path to the ONNX model file (used when Provider is "onnx").
+	ONNXModelPath string
 }
 
 // DefaultPipelineConfig returns a PipelineConfig with sensible defaults.
+// DataDir defaults to ".memory" in the current working directory.
 func DefaultPipelineConfig() PipelineConfig {
+	dataDir := ".memory"
+	if wd, err := os.Getwd(); err == nil {
+		dataDir = filepath.Join(wd, ".memory")
+	}
 	return PipelineConfig{
-		DataDir: ".memory",
+		DataDir: dataDir,
 		LLM: LLMConfig{
 			Timeout: 30 * time.Second,
 		},
 		Embedding: EmbeddingConfig{
+			Provider:   EmbeddingProviderOpenAI,
 			Dimensions: 1536,
 			Timeout:    10 * time.Second,
 		},
@@ -167,4 +199,27 @@ func DefaultPipelineConfig() PipelineConfig {
 		MaxSceneCount:              15,
 		MaxPersonaChars:            2000,
 	}
+}
+
+// PipelineConfigFromEnv creates a PipelineConfig populated from environment variables.
+// Falls back to DefaultPipelineConfig for any unset values.
+func PipelineConfigFromEnv() PipelineConfig {
+	cfg := DefaultPipelineConfig()
+
+	if v := os.Getenv("OPENAI_BASE_URL"); v != "" {
+		cfg.LLM.BaseURL = v
+		cfg.Embedding.BaseURL = v
+	}
+	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+		cfg.LLM.APIKey = v
+		cfg.Embedding.APIKey = v
+	}
+	if v := os.Getenv("OPENAI_MODEL"); v != "" {
+		cfg.LLM.Model = v
+	}
+	if v := os.Getenv("MEMORY_DATA_DIR"); v != "" {
+		cfg.DataDir = v
+	}
+
+	return cfg
 }

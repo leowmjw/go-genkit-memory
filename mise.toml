@@ -3,12 +3,11 @@
 
 [tools]
 go   = "1.26"
-node = "26"      # required for npx tsx (TencentDB gateway); npm/npx ship with node
 # air is installed via go install (see tasks.install below)
 # overmind is a native binary; install via brew or go install
 
 [env]
-# OpenAI-compatible local endpoint (used by the Go app)
+# OpenAI-compatible local endpoint (used by the Go app and pipeline)
 OPENAI_BASE_URL = "http://aibox:11435/v1"
 OPENAI_API_KEY  = "local"
 OPENAI_MODEL    = "gpt-oss-20b-Q8_0"
@@ -20,126 +19,22 @@ LOG_LEVEL = "debug"
 # Go build cache (optional speed-up on CI)
 GOFLAGS = "-mod=readonly"
 
-# TencentDB memory gateway location
-MEMORY_TENCENTDB_GATEWAY_HOST = "127.0.0.1"
-MEMORY_TENCENTDB_GATEWAY_PORT = "8420"
-
-# Disable gateway file logging in dev — default /data/log/ is not writable on macOS.
-# Set to a writable path (e.g. "/tmp/tdai-logs/") to enable file logging.
-LOG_PATH = ""
-
-# LLM credentials forwarded to the TencentDB Node.js gateway sidecar
-# The gateway reads MEMORY_TENCENTDB_LLM_* (not OPENAI_*).
-MEMORY_TENCENTDB_LLM_API_KEY  = "local"
-MEMORY_TENCENTDB_LLM_BASE_URL = "http://aibox:11435/v1"
-MEMORY_TENCENTDB_LLM_MODEL    = "gpt-oss-20b-Q8_0"
+# Memory pipeline data directory (default: .memory in working dir)
+# MEMORY_DATA_DIR = ".memory"
 
 # ─── Tasks ────────────────────────────────────────────────────────────────────
 
 [tasks.install]
-description = "Install Go-based dev tools (air) and Node.js gateway deps"
-run = [
-  "go install github.com/air-verse/air@latest",
-  "mise run tencentdb:install",
-]
+description = "Install Go-based dev tools (air)"
+run = "go install github.com/air-verse/air@latest"
 
 [tasks.build]
 description = "Compile the module"
 run = "go build ./..."
 
-[tasks."tencentdb:install"]
-description = "Download and install the TencentDB memory gateway (Node.js)"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-# All npm work happens under $HOME/.memory-tencentdb — NEVER in the repo directory.
-# A system mktemp dir is used for the download stage so no npm artefacts
-# (package.json, package-lock.json, node_modules) are left in the workspace.
-PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
-if [ -d "$PLUGIN_DIR" ]; then
-  echo "TencentDB gateway already installed at $PLUGIN_DIR"
-  exit 0
-fi
-
-echo "Installing @tencentdb-agent-memory/memory-tencentdb …"
-mkdir -p "$HOME/.memory-tencentdb"
-
-# Stage 1 — download into a system temp dir, then copy to final location.
-TEMP_DIR=$(mktemp -d /tmp/tdai-install-XXXXXX)
-trap 'rm -rf "$TEMP_DIR"' EXIT
-cd "$TEMP_DIR"   # explicitly in /tmp — not the repo
-
-# package.json overrides fix broken transitive dep version ranges:
-#  • @opentelemetry/api-logs ^0.218.0 locks minor in 0.x semver so 0.219.x is
-#    out of range — widen to >=0.218.0.
-#  • zod v3/v4 peer-dep split in @ai-sdk/openai — widen to >=3.25.0.
-node - <<'JSEOF'
-const fs = require('fs');
-fs.writeFileSync('package.json', JSON.stringify({
-  name: 'tdai-install', private: true,
-  overrides: { '@opentelemetry/api-logs': '>=0.218.0', 'zod': '>=3.25.0' }
-}, null, 2));
-JSEOF
-
-npm install @tencentdb-agent-memory/memory-tencentdb@latest \
-  --omit=dev --legacy-peer-deps --silent
-cp -r node_modules/@tencentdb-agent-memory/memory-tencentdb "$PLUGIN_DIR"
-
-# Stage 2 — install the plugin's own runtime deps inside $HOME (not /tmp, not the repo).
-# tsx ships as a direct dep in the package — no separate install needed.
-# Widen direct dep version ranges in-place (npm EOVERRIDE rejects overrides on direct deps).
-cd "$PLUGIN_DIR"
-node - <<'JSEOF'
-const fs = require('fs');
-const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-const widen = { '@opentelemetry/api-logs': '>=0.218.0', 'zod': '>=3.25.0' };
-for (const [name, range] of Object.entries(widen)) {
-  if (pkg.dependencies?.[name])     pkg.dependencies[name] = range;
-  if (pkg.devDependencies?.[name])  pkg.devDependencies[name] = range;
-  if (pkg.peerDependencies?.[name]) pkg.peerDependencies[name] = range;
-}
-delete pkg.overrides;
-fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
-JSEOF
-
-npm install --omit=dev --legacy-peer-deps --silent
-echo "TencentDB gateway installed at $PLUGIN_DIR"
-"""
-
-[tasks."tencentdb:upgrade"]
-description = "Upgrade the TencentDB memory gateway to the latest published version"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Remove the existing install and re-run tencentdb:install.
-# All temp work happens in /tmp — the repo directory is never touched.
-PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
-if [ -d "$PLUGIN_DIR" ]; then
-  echo "Removing existing gateway at $PLUGIN_DIR …"
-  rm -rf "$PLUGIN_DIR"
-fi
-mise run tencentdb:install
-"""
-
-[tasks."tencentdb:start"]
-description = "Start the TencentDB memory gateway (runs in the foreground)"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
-if [ ! -d "$PLUGIN_DIR" ]; then
-  echo "Gateway not installed. Run: mise run tencentdb:install"
-  exit 1
-fi
-cd "$PLUGIN_DIR"
-exec npx tsx src/gateway/server.ts
-"""
-
 [tasks.test]
 description = "Run unit tests (no external deps)"
-run = "go test ./session/... -race -count=1 -timeout 60s"
+run = "go test ./memory/... ./session/... -race -count=1 -timeout 60s"
 
 [tasks."test:int"]
 description = "Run integration tests (no external deps)"
@@ -194,7 +89,7 @@ echo ""
 
 # ── Go ────────────────────────────────────────────────────────────────────────
 GO_VER=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//')
-if command -v go &>/dev/null && [ "$(printf '%s\n' "1.26" "$GO_VER" | sort -V | head -1)" = "1.26" ]; then
+if command -v go &>/dev/null && [ "$(printf '%s\\n' "1.26" "$GO_VER" | sort -V | head -1)" = "1.26" ]; then
   echo "  ✔  go $GO_VER (>= 1.26)"
   PASS=$((PASS+1))
 else
@@ -204,60 +99,25 @@ else
 fi
 
 # ── air ───────────────────────────────────────────────────────────────────────
-check "air (hot-reload)" \
-  "command -v air" \
+check "air (hot-reload)" \\
+  "command -v air" \\
   "run: go install github.com/air-verse/air@latest  (or: mise run install)"
 
 # ── tmux ──────────────────────────────────────────────────────────────────────
-check "tmux (required by overmind)" \
-  "command -v tmux" \
+check "tmux (required by overmind)" \\
+  "command -v tmux" \\
   "macOS: brew install tmux  |  Linux: apt install tmux / dnf install tmux"
 
 # ── overmind ──────────────────────────────────────────────────────────────────
-check "overmind (process manager)" \
-  "command -v overmind" \
+check "overmind (process manager)" \\
+  "command -v overmind" \\
   "macOS: brew install overmind  |  Go: go install github.com/DarthSim/overmind/v2@latest"
-
-# ── Node.js ───────────────────────────────────────────────────────────────────
-NODE_VER=$(node --version 2>/dev/null | sed 's/v//')
-if command -v node &>/dev/null && [ "$(printf '%s\n' "22.16" "$NODE_VER" | sort -V | head -1)" = "22.16" ]; then
-  echo "  ✔  node $NODE_VER (>= 22.16)"
-  PASS=$((PASS+1))
-else
-  echo "  ✘  node >= 22.16 not found (found: ${NODE_VER:-none})"
-  echo "     → run: mise install  (installs node 22.16 via mise tools)"
-  FAIL=$((FAIL+1))
-fi
-
-# ── npm / npx ─────────────────────────────────────────────────────────────────
-check "npm (ships with node)" \
-  "command -v npm" \
-  "run: mise install  (npm is bundled with the node tool)"
-
-# ── TencentDB gateway plugin dir ──────────────────────────────────────────────
-PLUGIN_DIR="$HOME/.memory-tencentdb/tdai-memory-openclaw-plugin"
-check "tencentdb plugin dir ($PLUGIN_DIR)" \
-  "test -d '$PLUGIN_DIR'" \
-  "run: mise run tencentdb:install"
-
-# ── TencentDB gateway reachable ───────────────────────────────────────────────
-TDAI_HOST="${MEMORY_TENCENTDB_GATEWAY_HOST:-127.0.0.1}"
-TDAI_PORT="${MEMORY_TENCENTDB_GATEWAY_PORT:-8420}"
-if curl --silent --max-time 3 --fail "http://${TDAI_HOST}:${TDAI_PORT}/health" &>/dev/null; then
-  echo "  ✔  TencentDB gateway reachable: http://${TDAI_HOST}:${TDAI_PORT}"
-  PASS=$((PASS+1))
-else
-  echo "  ✘  TencentDB gateway NOT reachable: http://${TDAI_HOST}:${TDAI_PORT}"
-  echo "     → run: mise run dev  (starts all services via Overmind)"
-  echo "       or:  mise run tencentdb:start  (standalone)"
-  FAIL=$((FAIL+1))
-fi
 
 # ── OpenAI-compatible endpoint ────────────────────────────────────────────────
 ENDPOINT_URL="${OPENAI_BASE_URL:-http://aibox:11435/v1}"
 # strip /v1 suffix for the health-check ping
 BASE="${ENDPOINT_URL%/v1}"
-if curl --silent --max-time 3 --fail "${BASE}" &>/dev/null || \
+if curl --silent --max-time 3 --fail "${BASE}" &>/dev/null || \\
    curl --silent --max-time 3 --fail "${ENDPOINT_URL}/models" &>/dev/null; then
   echo "  ✔  OpenAI endpoint reachable: ${ENDPOINT_URL}"
   PASS=$((PASS+1))

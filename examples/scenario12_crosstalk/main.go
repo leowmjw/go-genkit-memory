@@ -57,8 +57,8 @@ func main() {
 	}
 
 	agents := []struct {
-		name    string
-		user    string
+		name      string
+		user      string
 		assistant string
 	}{
 		{"CodeGen", "Generate a JWT auth function", "func GenerateJWT(claims) (string, error) { ... }"},

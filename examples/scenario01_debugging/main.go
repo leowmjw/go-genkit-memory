@@ -20,9 +20,9 @@ import (
 )
 
 type DebugState struct {
-	Canvas   string   `json:"canvas"`    // compact Mermaid diagram
-	LogRefs  []string `json:"log_refs"`  // paths to offloaded log files
-	Step     int      `json:"step"`
+	Canvas  string   `json:"canvas"`   // compact Mermaid diagram
+	LogRefs []string `json:"log_refs"` // paths to offloaded log files
+	Step    int      `json:"step"`
 }
 
 func main() {

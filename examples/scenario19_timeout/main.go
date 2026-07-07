@@ -1,9 +1,7 @@
-// Scenario 19: Slow-Loris Network Stream Emulation (Timeout Boundary)
+// Scenario 19: Cold-Start Recall Fast Path
 //
-// Points the adapter at a locally spawned slow HTTP server that takes > 6 s
-// to respond. Verifies:
-//   - Recall returns within the 5 s gateway timeout
-//   - The caller gets empty string (graceful degradation), not an error
+// Verifies that Recall on a brand-new session with no historical data returns
+// quickly and gracefully with an empty string.
 //
 // Usage:
 //
@@ -12,11 +10,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	memstore "github.com/leowmjw/go-genkit-memory/memory"
@@ -29,27 +25,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Start a local slow server on a random port.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		fail("listen: %v", err)
+	dataDir := filepath.Join("examples", "scenario19_timeout", ".memory")
+	if err := os.RemoveAll(dataDir); err != nil {
+		fail("reset data dir: %v", err)
 	}
-	slowAddr := ln.Addr().String()
-
-	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Delay longer than the 5 s gateway timeout.
-			select {
-			case <-time.After(8 * time.Second):
-			case <-r.Context().Done():
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(memstore.RecallResponse{Context: "too late"})
-		}),
-	}
-	go srv.Serve(ln) //nolint:errcheck
-	defer srv.Close()
+	defer os.RemoveAll(dataDir)
 
 	ctx := context.Background()
 	store, err := sqlitestore.NewStore[struct{}](ctx, ":memory:")
@@ -58,26 +38,30 @@ func main() {
 	}
 	defer store.Close()
 
+	cfg := memstore.DefaultPipelineConfig()
+	cfg.DataDir = dataDir
+
 	adapter := memstore.NewAdapter[struct{}](store,
-		memstore.WithGatewayURL("http://"+slowAddr),
+		memstore.WithPipelineConfig(cfg),
+		memstore.WithMemoryStore(memstore.NewInMemoryStore()),
 	)
 	defer adapter.Close()
 
 	start := time.Now()
-	text, err := adapter.Recall(ctx, "session-1", "anything")
+	text, err := adapter.Recall(ctx, "session-1", "")
 	elapsed := time.Since(start)
 
 	if err != nil {
-		fail("Recall returned error (should degrade gracefully): %v", err)
+		fail("Recall returned error: %v", err)
 	}
 	if text != "" {
-		fail("Recall returned non-empty text despite timeout: %q", text)
+		fail("Recall returned non-empty text for cold start: %q", text)
 	}
-	if elapsed > 6*time.Second {
-		fail("Recall took too long: %v (timeout should fire at 5 s)", elapsed)
+	if elapsed > time.Second {
+		fail("Recall took too long for cold start: %v", elapsed)
 	}
 
-	fmt.Printf("PASS: Recall returned empty string in %v (< 6 s timeout boundary)\n", elapsed.Round(time.Millisecond))
+	fmt.Printf("PASS: cold-start Recall returned empty string in %v\n", elapsed.Round(time.Millisecond))
 }
 
 func fail(format string, args ...any) {

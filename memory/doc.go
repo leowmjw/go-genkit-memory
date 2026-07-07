@@ -1,15 +1,15 @@
-// Package memory provides a TencentDB-Agent-Memory adapter for genkit-go.
+// Package memory provides a 4-tier semantic memory pipeline for genkit-go.
 //
-// It implements [session.Store] and connects to the TencentDB memory gateway
-// sidecar (default: 127.0.0.1:8420) to provide a four-tier memory pipeline:
+// It implements [session.Store] and runs an in-process L0→L3 pipeline using
+// an OpenAI-compatible LLM endpoint for semantic processing:
 //
-//   - L0: raw conversation capture (async, non-blocking)
-//   - L1: episodic atom extraction (gateway-side, every N turns)
-//   - L2: scene block aggregation (gateway-side)
-//   - L3: persona synthesis (gateway-side, every N memories)
+//   - L0: raw conversation capture (append-only JSONL, permissive)
+//   - L1: episodic atom extraction + deduplication (LLM-powered)
+//   - L2: scene block aggregation (LLM-powered)
+//   - L3: persona synthesis (LLM-powered, ≤2000 chars)
 //
 // The adapter wraps any existing [session.Store] (in-memory, BBolt, SQLite)
-// for durable state storage and layers the gateway on top for long-term memory.
+// for durable state storage and layers the pipeline on top for long-term memory.
 //
 // # Quick start
 //

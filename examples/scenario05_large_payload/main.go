@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	memstore "github.com/leowmjw/go-genkit-memory/memory"
 	sqlitestore "github.com/leowmjw/go-genkit-memory/session/sqlite"
@@ -32,7 +31,17 @@ func main() {
 	}
 
 	ctx := context.Background()
-	refsDir := filepath.Join(os.TempDir(), fmt.Sprintf("genkit-refs-%d", time.Now().UnixMilli()))
+	dataDir := filepath.Join("examples", "scenario05_large_payload", ".memory")
+	refsDir := filepath.Join(dataDir, "refs")
+	if err := os.RemoveAll(dataDir); err != nil {
+		fail("reset data dir: %v", err)
+	}
+	defer os.RemoveAll(dataDir)
+
+	cfg := memstore.DefaultPipelineConfig()
+	cfg.DataDir = dataDir
+	cfg.L1TriggerAfterTurns = 1000
+
 	defer os.RemoveAll(refsDir)
 
 	store, err := sqlitestore.NewStore[TraceState](ctx, ":memory:")
@@ -42,8 +51,9 @@ func main() {
 	defer store.Close()
 
 	adapter := memstore.NewAdapter[TraceState](store,
+		memstore.WithPipelineConfig(cfg),
+		memstore.WithMemoryStore(memstore.NewInMemoryStore()),
 		memstore.WithRefsDir(refsDir),
-		memstore.WithGatewayURL("http://127.0.0.1:19997"), // dead gateway; capture only tests offload path
 	)
 	defer adapter.Close()
 
@@ -53,12 +63,10 @@ func main() {
 		fail("test setup error: dump too small (%d bytes)", len(hugeDump))
 	}
 
-	// The offload path is exercised INSIDE Capture before the HTTP call.
-	// Even if the gateway is dead, the file should be written to refs/.
-	_ = adapter.Capture(ctx, "trace-session", hugeDump, "Extracted 1400 environment variables.")
-
-	// Give the goroutine a moment to attempt capture and write the offload file.
-	time.Sleep(200 * time.Millisecond)
+	// The offload path is exercised inside Capture before deeper pipeline work.
+	if err := adapter.Capture(ctx, "trace-session", hugeDump, "Extracted 1400 environment variables."); err != nil {
+		fail("capture large payload: %v", err)
+	}
 
 	// Verify refs/ directory was created and contains at least one .md file.
 	entries, err := os.ReadDir(refsDir)
