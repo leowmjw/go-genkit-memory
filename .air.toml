@@ -15,7 +15,7 @@ include_ext = ["go", "toml", "yaml", "env"]
 exclude_dir = [
   "tmp", "vendor", ".git", "testdata",
   "node_modules",                   # JS deps — from .gitignore
-  ".memory-tencentdb",              # TencentDB gateway install dir
+  "cache",                          # TLS CA bundle cache
   "bin",                            # compiled binaries — from .gitignore
 #  "integration",                    # integration tests don't trigger rebuilds
 #  "examples",                       # standalone programs, not part of the daemon
