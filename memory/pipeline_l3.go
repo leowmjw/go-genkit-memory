@@ -12,14 +12,9 @@ import (
 )
 
 // callLLMPersona is a function variable seam for testing.
-// It calls the LLM for L3 persona generation.
+// It calls the LLM for L3 persona generation (outputs markdown, not JSON).
 var callLLMPersona = func(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
-	// Stub: real implementation calls OpenAI-compatible chat completions endpoint.
-	_ = ctx
-	_ = cfg
-	_ = systemPrompt
-	_ = userPrompt
-	return "", nil
+	return callChatCompletionText(ctx, cfg, systemPrompt, userPrompt)
 }
 
 // L3PersonaGenerator synthesizes a user persona from scene blocks.

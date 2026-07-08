@@ -10,12 +10,7 @@ import (
 // callLLMDedup is a function variable seam for testing.
 // It calls the LLM for conflict detection between new and existing memories.
 var callLLMDedup = func(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
-	// Stub: real implementation calls OpenAI-compatible chat completions endpoint.
-	_ = ctx
-	_ = cfg
-	_ = systemPrompt
-	_ = userPrompt
-	return "[]", nil
+	return callChatCompletion(ctx, cfg, systemPrompt, userPrompt)
 }
 
 // searchVectors is a function variable seam for testing.

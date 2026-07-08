@@ -14,12 +14,7 @@ import (
 // callLLMScene is a function variable seam for testing.
 // It calls the LLM for L2 scene extraction/update/merge.
 var callLLMScene = func(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
-	// Stub: real implementation calls OpenAI-compatible chat completions endpoint.
-	_ = ctx
-	_ = cfg
-	_ = systemPrompt
-	_ = userPrompt
-	return "{}", nil
+	return callChatCompletion(ctx, cfg, systemPrompt, userPrompt)
 }
 
 // L2SceneExtractor groups L1 memories into scene blocks (.md files).

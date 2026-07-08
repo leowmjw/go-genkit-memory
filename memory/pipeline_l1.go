@@ -12,12 +12,7 @@ import (
 // callLLMExtract is a function variable seam for testing.
 // It calls the LLM for L1 memory extraction from conversation messages.
 var callLLMExtract = func(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
-	// Stub: real implementation calls OpenAI-compatible chat completions endpoint.
-	_ = ctx
-	_ = cfg
-	_ = systemPrompt
-	_ = userPrompt
-	return "[]", nil
+	return callChatCompletion(ctx, cfg, systemPrompt, userPrompt)
 }
 
 // L1Extractor extracts atomic memories from L0 conversation records using LLM.
