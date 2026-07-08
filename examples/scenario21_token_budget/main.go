@@ -1,8 +1,8 @@
-// Scenario 21: Deep Memory Context Starvation & LLM Window Overflow Fallbacks
+// Scenario 21: Deep Memory Context Token Budget Trimming
 //
-// Verifies that when the gateway returns a massive recall context that would
-// overflow the LLM token window, the adapter's token budget trimmer truncates
-// it to a safe size before it reaches the generation layer.
+// Pre-populates the local memory store with a massive memory record and
+// verifies the adapter trims the recalled context to the configured token
+// budget before it reaches the generation layer.
 //
 // Usage:
 //
@@ -11,12 +11,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	memstore "github.com/leowmjw/go-genkit-memory/memory"
 	sqlitestore "github.com/leowmjw/go-genkit-memory/session/sqlite"
@@ -28,25 +27,19 @@ type BudgetState struct {
 
 func main() {
 	if os.Getenv("INTEGRATION_LIVE") != "1" {
-		fmt.Println("SKIP: set INTEGRATION_LIVE=1 to run (requires gateway + LLM)")
+		fmt.Println("SKIP: set INTEGRATION_LIVE=1 to run")
 		os.Exit(0)
 	}
 
 	ctx := context.Background()
+	dataDir := filepath.Join("examples", "scenario21_token_budget", ".memory")
+	if err := os.RemoveAll(dataDir); err != nil {
+		fail("reset data dir: %v", err)
+	}
+	defer os.RemoveAll(dataDir)
 
-	// Gateway that returns a 200 KB recall context — way above any token budget.
 	const hugeContextBytes = 200 * 1024
-	hugeContext := strings.Repeat("historical context sentence. ", hugeContextBytes/30)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/recall" {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"context": hugeContext})
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+	hugeContext := strings.Repeat("project constraints historical context sentence. ", hugeContextBytes/47)
 
 	store, err := sqlitestore.NewStore[BudgetState](ctx, ":memory:")
 	if err != nil {
@@ -54,10 +47,27 @@ func main() {
 	}
 	defer store.Close()
 
+	memStore := memstore.NewInMemoryStore()
+	if err := memStore.UpsertL1(memstore.MemoryRecord{
+		ID:        "huge-memory-1",
+		Content:   hugeContext,
+		Type:      memstore.MemoryTypeEpisodic,
+		Priority:  95,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}, nil); err != nil {
+		fail("populate memory store: %v", err)
+	}
+
+	cfg := memstore.DefaultPipelineConfig()
+	cfg.DataDir = dataDir
+	cfg.Embedding = memstore.EmbeddingConfig{}
+
 	// Token budget: 4096 tokens ≈ ~16 KB of text (4 chars/token heuristic).
 	const maxTokens = 4096
 	adapter := memstore.NewAdapter[BudgetState](store,
-		memstore.WithGatewayURL(srv.URL),
+		memstore.WithPipelineConfig(cfg),
+		memstore.WithMemoryStore(memStore),
 		memstore.WithMaxRecallTokens(maxTokens),
 	)
 	defer adapter.Close()

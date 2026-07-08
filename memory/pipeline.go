@@ -14,8 +14,7 @@ const (
 	LayerL3 Layer = 3
 )
 
-// CaptureRequest is the body sent to POST /capture.
-// Fields match the gateway's required schema exactly.
+// CaptureRequest is the internal request for L0 capture.
 type CaptureRequest struct {
 	SessionKey       string `json:"session_key"`
 	UserContent      string `json:"user_content"`
@@ -24,29 +23,18 @@ type CaptureRequest struct {
 
 // Message is a single conversational turn entry used internally.
 type Message struct {
-	Role    string `json:"role"`    // "user" | "assistant" | "system"
+	Role    string `json:"role"` // "user" | "assistant" | "system"
 	Content string `json:"content"`
 }
 
-// RecallRequest is the body sent to POST /recall.
+// RecallRequest is the internal request for context recall.
 type RecallRequest struct {
 	SessionKey string `json:"session_key"`
 	Query      string `json:"query"`
 }
 
-// RecallResponse is the response body from POST /recall.
+// RecallResponse is the internal response from context recall.
 type RecallResponse struct {
 	// Context is the enriched historical text to inject before LLM generation.
 	Context string `json:"context"`
-}
-
-// SessionEndRequest is the body sent to POST /session/end.
-type SessionEndRequest struct {
-	SessionKey string `json:"session_key"`
-}
-
-// HealthResponse is the response body from GET /health.
-type HealthResponse struct {
-	// Status is "ok" or "degraded".
-	Status string `json:"status"`
 }

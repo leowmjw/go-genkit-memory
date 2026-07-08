@@ -8,205 +8,198 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 )
 
-const (
-	gatewayTimeout          = 5 * time.Second
-	circuitBreakerThreshold = 5
-	circuitBreakerPause     = 60 * time.Second
-	captureMaxInflight      = 4
-	captureInflightTimeout  = 5 * time.Second
-)
-
-// gatewayClient is an HTTP client for the TencentDB memory gateway.
-// It enforces a 5-second request timeout, a circuit breaker (5 consecutive
-// failures → 60 s pause), and back-pressure (max 4 in-flight captures).
-type gatewayClient struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
-	log        *slog.Logger
-
-	// circuit breaker
-	mu         sync.Mutex
-	failures   int
-	pauseUntil time.Time
-
-	// back-pressure semaphore: limits concurrent capture goroutines
-	captureSem chan struct{}
+// chatCompletionRequest is the OpenAI-compatible chat completions request body.
+type chatCompletionRequest struct {
+	Model       string              `json:"model"`
+	Messages    []chatMessage       `json:"messages"`
+	Temperature float64             `json:"temperature,omitempty"`
+	MaxTokens   int                 `json:"max_tokens,omitempty"`
+	Stream      bool                `json:"stream"`
+	ResponseFormat *responseFormat  `json:"response_format,omitempty"`
 }
 
-// newGatewayClient constructs a client pointing at baseURL.
-func newGatewayClient(baseURL, apiKey string, log *slog.Logger) *gatewayClient {
-	return &gatewayClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		httpClient: &http.Client{
-			Timeout: gatewayTimeout,
+// responseFormat requests a specific output format from the LLM.
+type responseFormat struct {
+	Type string `json:"type"` // "json_object" for JSON mode
+}
+
+// chatMessage is a single message in the chat completion request.
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// chatCompletionResponse is the OpenAI-compatible chat completions response.
+type chatCompletionResponse struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// callChatCompletion calls an OpenAI-compatible chat completions endpoint.
+// It sends the system and user prompts as messages and returns the assistant's
+// response content. The function respects context cancellation and applies the
+// configured timeout.
+//
+// This is the underlying implementation used by all LLM function variable seams
+// (callLLMExtract, callLLMDedup, callLLMScene, callLLMPersona).
+func callChatCompletion(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
+	if cfg.BaseURL == "" {
+		return "", fmt.Errorf("client: LLM BaseURL is not configured")
+	}
+
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	reqBody := chatCompletionRequest{
+		Model: cfg.Model,
+		Messages: []chatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
 		},
-		log:        log,
-		captureSem: make(chan struct{}, captureMaxInflight),
+		Temperature: 0.1, // low temperature for deterministic extraction
+		Stream:      false,
+		ResponseFormat: &responseFormat{Type: "json_object"},
 	}
-}
 
-// isOpen returns true when the circuit breaker is open (requests are paused).
-func (c *gatewayClient) isOpen() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.failures >= circuitBreakerThreshold {
-		if time.Now().Before(c.pauseUntil) {
-			return true
-		}
-		// Pause window expired — reset.
-		c.failures = 0
-	}
-	return false
-}
-
-// recordSuccess resets the circuit-breaker failure counter.
-func (c *gatewayClient) recordSuccess() {
-	c.mu.Lock()
-	c.failures = 0
-	c.mu.Unlock()
-}
-
-// recordFailure increments the failure counter and may arm the circuit breaker.
-func (c *gatewayClient) recordFailure() {
-	c.mu.Lock()
-	c.failures++
-	if c.failures >= circuitBreakerThreshold {
-		c.pauseUntil = time.Now().Add(circuitBreakerPause)
-	}
-	c.mu.Unlock()
-}
-
-// post sends a JSON-encoded body to the given path and decodes the response into v.
-func (c *gatewayClient) post(ctx context.Context, path string, body, v any) error {
-	start := time.Now()
-
-	buf, err := json.Marshal(body)
+	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("memory: marshal request: %w", err)
+		return "", fmt.Errorf("client: marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+path, bytes.NewReader(buf))
+	httpCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	url := cfg.BaseURL + "/chat/completions"
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("memory: build request: %w", err)
+		return "", fmt.Errorf("client: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		c.recordFailure()
-		return fmt.Errorf("memory: POST %s: %w", path, err)
+		return "", fmt.Errorf("client: request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		c.recordFailure()
-		return fmt.Errorf("memory: POST %s: HTTP %d: %s", path, resp.StatusCode, body)
+	latency := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return "", fmt.Errorf("client: HTTP %d: %s", resp.StatusCode, respBody)
 	}
 
-	if v != nil {
-		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-			c.recordFailure()
-			return fmt.Errorf("memory: decode response from %s: %w", path, err)
-		}
+	var result chatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("client: decode response: %w", err)
 	}
 
-	c.recordSuccess()
-	if lat := time.Since(start); lat > 500*time.Millisecond {
-		c.log.Debug("gateway call slow",
-			slog.String("path", path),
-			slog.Duration("latency", lat),
-		)
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("client: empty response (no choices)")
 	}
-	return nil
+
+	content := result.Choices[0].Message.Content
+
+	slog.Debug("LLM call complete",
+		slog.String("model", cfg.Model),
+		slog.Duration("latency", latency),
+		slog.Int("prompt_tokens", result.Usage.PromptTokens),
+		slog.Int("completion_tokens", result.Usage.CompletionTokens),
+	)
+
+	return content, nil
 }
 
-// Capture fires an async L0 capture for the given session turn.
-// It respects the back-pressure semaphore (max 4 in-flight).
-// Returns immediately; the actual HTTP call runs in a goroutine.
-// If the semaphore is full, the oldest slot is waited on for up to 5 s.
-// onFailure is called from the goroutine if the HTTP call fails; it may be nil.
-func (c *gatewayClient) Capture(ctx context.Context, req CaptureRequest, onFailure func(error)) error {
-	if c.isOpen() {
-		err := fmt.Errorf("memory: circuit breaker open — skipping capture")
-		if onFailure != nil {
-			onFailure(err)
-		}
-		return err
+// callChatCompletionText is like callChatCompletion but does not request JSON
+// response format. Used for L3 persona generation which outputs markdown.
+func callChatCompletionText(ctx context.Context, cfg LLMConfig, systemPrompt, userPrompt string) (string, error) {
+	if cfg.BaseURL == "" {
+		return "", fmt.Errorf("client: LLM BaseURL is not configured")
 	}
 
-	// Back-pressure: wait for a slot, but cap the wait.
-	acquireCtx, cancel := context.WithTimeout(ctx, captureInflightTimeout)
+	timeout := cfg.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	reqBody := chatCompletionRequest{
+		Model: cfg.Model,
+		Messages: []chatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: 0.3,
+		Stream:      false,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("client: marshal request: %w", err)
+	}
+
+	httpCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	select {
-	case c.captureSem <- struct{}{}:
-	case <-acquireCtx.Done():
-		err := fmt.Errorf("memory: capture back-pressure timeout: %w", acquireCtx.Err())
-		if onFailure != nil {
-			onFailure(err)
-		}
-		return err
-	}
 
-	go func() {
-		defer func() { <-c.captureSem }()
-		// Use a fresh background context; the caller's context may expire.
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), gatewayTimeout)
-		defer bgCancel()
-		if err := c.post(bgCtx, "/capture", req, nil); err != nil {
-			c.log.Warn("L0 capture failed", slog.String("err", err.Error()))
-			if onFailure != nil {
-				onFailure(err)
-			}
-		}
-	}()
-	return nil
-}
-
-// Recall queries the gateway for enriched L1–L3 context.
-func (c *gatewayClient) Recall(ctx context.Context, req RecallRequest) (string, error) {
-	if c.isOpen() {
-		return "", fmt.Errorf("memory: circuit breaker open — skipping recall")
-	}
-	var resp RecallResponse
-	if err := c.post(ctx, "/recall", req, &resp); err != nil {
-		return "", err
-	}
-	return resp.Context, nil
-}
-
-// EndSession flushes pending pipeline work for a session.
-func (c *gatewayClient) EndSession(ctx context.Context, sessionKey string) error {
-	if c.isOpen() {
-		return nil // best-effort; skip if breaker open
-	}
-	return c.post(ctx, "/session/end", SessionEndRequest{SessionKey: sessionKey}, nil)
-}
-
-// Health checks if the gateway is responsive.
-func (c *gatewayClient) Health(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
+	url := cfg.BaseURL + "/chat/completions"
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("memory: health check: %w", err)
+		return "", fmt.Errorf("client: build request: %w", err)
 	}
-	resp, err := c.httpClient.Do(req)
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	}
+
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("memory: health check: %w", err)
+		return "", fmt.Errorf("client: request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	var h HealthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
-		return "", fmt.Errorf("memory: decode health: %w", err)
+
+	latency := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return "", fmt.Errorf("client: HTTP %d: %s", resp.StatusCode, respBody)
 	}
-	return h.Status, nil
+
+	var result chatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("client: decode response: %w", err)
+	}
+
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("client: empty response (no choices)")
+	}
+
+	content := result.Choices[0].Message.Content
+
+	slog.Debug("LLM call complete",
+		slog.String("model", cfg.Model),
+		slog.Duration("latency", latency),
+		slog.Int("prompt_tokens", result.Usage.PromptTokens),
+		slog.Int("completion_tokens", result.Usage.CompletionTokens),
+	)
+
+	return content, nil
 }

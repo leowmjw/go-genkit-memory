@@ -42,10 +42,10 @@ func main() {
 
 	// Invalid UTF-8 sequences — raw bytes that are not valid Unicode.
 	badInputs := [][]byte{
-		{0xff, 0xfe, 0x00, 0x41},                   // BOM + null + ASCII
-		{0xc0, 0xaf},                                 // overlong encoding
-		{0xed, 0xa0, 0x80},                           // surrogate half
-		{0x80, 0x81, 0x82, 0x83},                     // continuation bytes without lead
+		{0xff, 0xfe, 0x00, 0x41},                      // BOM + null + ASCII
+		{0xc0, 0xaf},                                  // overlong encoding
+		{0xed, 0xa0, 0x80},                            // surrogate half
+		{0x80, 0x81, 0x82, 0x83},                      // continuation bytes without lead
 		[]byte("valid prefix\xff\xfe invalid suffix"), // mixed valid+invalid
 	}
 

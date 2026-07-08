@@ -32,7 +32,7 @@ type ConversationState struct {
 
 // Message represents a single conversational turn.
 type Message struct {
-	Role    string `json:"role"`    // "user" | "assistant"
+	Role    string `json:"role"` // "user" | "assistant"
 	Content string `json:"content"`
 	Turn    int    `json:"turn"`
 }

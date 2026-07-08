@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,58 +50,68 @@ func (s *testStore) Delete(_ context.Context, id string) error {
 
 func (s *testStore) Close() error { return nil }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── test helpers ─────────────────────────────────────────────────────────────
 
-// fakeGateway runs a minimal HTTP server that records calls and returns
-// configurable responses.
-type fakeGateway struct {
-	captureCount atomic.Int64
-	recallResult string
-	healthStatus string
-	slowFor      time.Duration // if set, /recall sleeps for this duration
-	srv          *httptest.Server
-}
+// stubAllLLM replaces all LLM function seams with stubs for testing.
+// Returns a cleanup function that restores originals.
+func stubAllLLM(t *testing.T) {
+	t.Helper()
 
-func newFakeGateway(recallResult, healthStatus string) *fakeGateway {
-	fg := &fakeGateway{recallResult: recallResult, healthStatus: healthStatus}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /capture", func(w http.ResponseWriter, _ *http.Request) {
-		fg.captureCount.Add(1)
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("POST /recall", func(w http.ResponseWriter, r *http.Request) {
-		if fg.slowFor > 0 {
-			select {
-			case <-time.After(fg.slowFor):
-			case <-r.Context().Done():
-				return
-			}
+	origExtract := callLLMExtract
+	callLLMExtract = func(_ context.Context, _ LLMConfig, _, _ string) (string, error) {
+		segments := []SceneSegment{{
+			SceneName: "test",
+			Memories: []MemoryRecord{{
+				Content:  "test memory",
+				Type:     MemoryTypePersona,
+				Priority: 50,
+			}},
+		}}
+		b, _ := json.Marshal(segments)
+		return string(b), nil
+	}
+	t.Cleanup(func() { callLLMExtract = origExtract })
+
+	origEmbed := embedBatch
+	embedBatch = func(_ context.Context, _ EmbeddingConfig, texts []string) ([][]float32, error) {
+		result := make([][]float32, len(texts))
+		for i := range texts {
+			result[i] = []float32{0.1, 0.2, 0.3}
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(RecallResponse{Context: fg.recallResult})
-	})
-	mux.HandleFunc("POST /session/end", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(HealthResponse{Status: fg.healthStatus})
-	})
-	fg.srv = httptest.NewServer(mux)
-	return fg
+		return result, nil
+	}
+	t.Cleanup(func() { embedBatch = origEmbed })
+
+	origWrite := writeJSONL
+	writeJSONL = func(_ string, _ []L0MessageRecord) error { return nil }
+	t.Cleanup(func() { writeJSONL = origWrite })
 }
 
-func (fg *fakeGateway) Close() { fg.srv.Close() }
+func newTestAdapter(t *testing.T) *Adapter[memState] {
+	t.Helper()
+	store := newTestStore()
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+	log := slog.New(slog.NewJSONHandler(nil, &slog.HandlerOptions{Level: slog.LevelError}))
+	// Use discard logger for tests.
+	log = slog.Default()
+
+	return NewAdapter[memState](store,
+		WithPipelineConfig(cfg),
+		WithLogger(log),
+	)
+}
 
 // ─── adapter unit tests ───────────────────────────────────────────────────────
 
 // TestAdapter_GetSaveDelegate verifies that Get/Save pass through to the underlying store.
 func TestAdapter_GetSaveDelegate(t *testing.T) {
-	fg := newFakeGateway("", "ok")
-	defer fg.Close()
+	stubAllLLM(t)
 
 	store := newTestStore()
-	a := NewAdapter[memState](store, WithGatewayURL(fg.srv.URL))
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+	a := NewAdapter[memState](store, WithPipelineConfig(cfg))
 	defer a.Close()
 
 	ctx := context.Background()
@@ -124,11 +131,12 @@ func TestAdapter_GetSaveDelegate(t *testing.T) {
 
 // TestAdapter_DeleteDelegate verifies Delete passes through to the underlying store.
 func TestAdapter_DeleteDelegate(t *testing.T) {
-	fg := newFakeGateway("", "ok")
-	defer fg.Close()
+	stubAllLLM(t)
 
 	store := newTestStore()
-	a := NewAdapter[memState](store, WithGatewayURL(fg.srv.URL))
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+	a := NewAdapter[memState](store, WithPipelineConfig(cfg))
 	defer a.Close()
 
 	ctx := context.Background()
@@ -144,37 +152,57 @@ func TestAdapter_DeleteDelegate(t *testing.T) {
 	}
 }
 
-// TestAdapter_CaptureReachesGateway verifies that Capture fires an HTTP call.
-func TestAdapter_CaptureReachesGateway(t *testing.T) {
-	fg := newFakeGateway("", "ok")
-	defer fg.Close()
+// TestAdapter_CaptureProcessesThroughPipeline verifies that Capture feeds the local pipeline.
+func TestAdapter_CaptureProcessesThroughPipeline(t *testing.T) {
+	stubAllLLM(t)
 
-	a := NewAdapter[memState](newTestStore(), WithGatewayURL(fg.srv.URL))
+	store := newTestStore()
+	memStore := NewInMemoryStore()
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.L1TriggerAfterTurns = 1
+
+	a := NewAdapter[memState](store,
+		WithPipelineConfig(cfg),
+		WithMemoryStore(memStore),
+	)
 	defer a.Close()
 
 	ctx := context.Background()
-	if err := a.Capture(ctx, "sess-1", "hello", "world"); err != nil {
+	if err := a.Capture(ctx, "sess-1", "hello there user message", "world assistant response"); err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
 
-	// Give the goroutine time to fire.
-	time.Sleep(50 * time.Millisecond)
-	if n := fg.captureCount.Load(); n != 1 {
-		t.Errorf("want 1 capture, got %d", n)
+	// Verify L1 memory was stored via pipeline.
+	all, _ := memStore.GetAllL1()
+	if len(all) != 1 {
+		t.Errorf("want 1 L1 memory stored, got %d", len(all))
 	}
 }
 
 // TestAdapter_RecallReturnsTrimmedContext verifies token budget trimming.
 func TestAdapter_RecallReturnsTrimmedContext(t *testing.T) {
-	fg := newFakeGateway(strings.Repeat("x", 200), "ok")
-	defer fg.Close()
+	stubAllLLM(t)
 
-	a := NewAdapter[memState](newTestStore(), WithGatewayURL(fg.srv.URL), WithTokenBudget(100))
+	memStore := NewInMemoryStore()
+	// Insert a memory so recall has something to return.
+	_ = memStore.UpsertL1(MemoryRecord{
+		ID: "m1", Content: strings.Repeat("x", 200), Type: MemoryTypePersona,
+		Priority: 80, CreatedAt: time.Now(),
+	}, []float32{0.1, 0.2, 0.3})
+
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+
+	a := NewAdapter[memState](newTestStore(),
+		WithPipelineConfig(cfg),
+		WithMemoryStore(memStore),
+		WithTokenBudget(100),
+	)
 	defer a.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	text, err := a.Recall(ctx, "sess-1", "query")
+	ctx := context.Background()
+	text, err := a.Recall(ctx, "sess-1", "query something")
 	if err != nil {
 		t.Fatalf("Recall: %v", err)
 	}
@@ -184,89 +212,54 @@ func TestAdapter_RecallReturnsTrimmedContext(t *testing.T) {
 }
 
 // TestAdapter_RecallGracefulDegradation verifies that Recall returns empty
-// string (no error) when the gateway is unreachable.
+// string (no error) when the pipeline has no relevant data.
 func TestAdapter_RecallGracefulDegradation(t *testing.T) {
-	a := NewAdapter[memState](newTestStore(),
-		WithGatewayURL("http://127.0.0.1:19999")) // nothing listening
+	stubAllLLM(t)
+
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+
+	a := NewAdapter[memState](newTestStore(), WithPipelineConfig(cfg))
 	defer a.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	text, err := a.Recall(ctx, "sess-1", "query")
+	ctx := context.Background()
+	text, err := a.Recall(ctx, "sess-1", "query something")
 	if err != nil {
-		t.Fatalf("Recall should not surface errors on gateway failure, got: %v", err)
+		t.Fatalf("Recall should not error, got: %v", err)
 	}
 	if text != "" {
-		t.Errorf("expected empty string on degradation, got %q", text)
+		t.Errorf("expected empty string for empty store, got %q", text)
 	}
 }
 
-// TestAdapter_CaptureBuffersOnGatewayFailure verifies fallback buffering.
-func TestAdapter_CaptureBuffersOnGatewayFailure(t *testing.T) {
-	a := NewAdapter[memState](newTestStore(),
-		WithGatewayURL("http://127.0.0.1:19999"))
+// TestAdapter_CaptureBuffersOnPipelineFailure verifies fallback buffering.
+func TestAdapter_CaptureBuffersOnPipelineFailure(t *testing.T) {
+	// Make writeJSONL fail to simulate pipeline error.
+	origWrite := writeJSONL
+	writeJSONL = func(_ string, _ []L0MessageRecord) error {
+		return fmt.Errorf("simulated write failure")
+	}
+	t.Cleanup(func() { writeJSONL = origWrite })
+
+	origEmbed := embedBatch
+	embedBatch = func(_ context.Context, _ EmbeddingConfig, texts []string) ([][]float32, error) {
+		return make([][]float32, len(texts)), nil
+	}
+	t.Cleanup(func() { embedBatch = origEmbed })
+
+	cfg := DefaultPipelineConfig()
+	cfg.DataDir = t.TempDir()
+
+	a := NewAdapter[memState](newTestStore(), WithPipelineConfig(cfg))
 	defer a.Close()
 
 	ctx := context.Background()
 	for i := range 3 {
-		_ = a.Capture(ctx, "sess-1", fmt.Sprintf("user%d", i), fmt.Sprintf("assist%d", i))
+		_ = a.Capture(ctx, "sess-1", fmt.Sprintf("user%d msg", i), fmt.Sprintf("assist%d response", i))
 	}
 
-	// Allow goroutines to fail and buffer.
-	time.Sleep(200 * time.Millisecond)
 	if n := a.FallbackLen(); n != 3 {
 		t.Errorf("want 3 buffered, got %d", n)
-	}
-}
-
-// TestAdapter_SlowGatewayTimeout verifies the 5 s recall timeout fires.
-func TestAdapter_SlowGatewayTimeout(t *testing.T) {
-	fg := newFakeGateway("ctx", "ok")
-	fg.slowFor = 8 * time.Second // longer than gatewayTimeout (5 s)
-	defer fg.Close()
-
-	a := NewAdapter[memState](newTestStore(), WithGatewayURL(fg.srv.URL))
-	defer a.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	start := time.Now()
-	text, err := a.Recall(ctx, "sess-1", "query")
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("Recall should degrade gracefully, not error: %v", err)
-	}
-	if text != "" {
-		t.Errorf("expected empty string on timeout, got %q", text)
-	}
-	if elapsed > 6*time.Second {
-		t.Errorf("timeout took too long: %v (want < 6 s)", elapsed)
-	}
-}
-
-// TestAdapter_CircuitBreaker verifies the circuit breaker opens after 5 fails.
-func TestAdapter_CircuitBreaker(t *testing.T) {
-	// Use a server that always returns 500.
-	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer failSrv.Close()
-
-	c := newGatewayClient(failSrv.URL, "", nil)
-	if c.log == nil {
-		// replace nil logger with discard
-		c.log = slog.Default()
-	}
-	ctx := context.Background()
-
-	// Trigger failures synchronously by calling post directly.
-	for i := range circuitBreakerThreshold {
-		_ = c.post(ctx, "/capture", CaptureRequest{}, nil)
-		_ = i
-	}
-
-	if !c.isOpen() {
-		t.Error("circuit breaker should be open after 5 consecutive failures")
 	}
 }
 

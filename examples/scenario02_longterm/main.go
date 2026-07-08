@@ -20,7 +20,7 @@ import (
 )
 
 type DesignState struct {
-	Turn        int    `json:"turn"`
+	Turn         int    `json:"turn"`
 	LastDecision string `json:"last_decision"`
 }
 

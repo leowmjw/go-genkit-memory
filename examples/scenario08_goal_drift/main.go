@@ -20,8 +20,8 @@ import (
 )
 
 type DriftState struct {
-	Topic   string `json:"topic"`
-	Turn    int    `json:"turn"`
+	Topic string `json:"topic"`
+	Turn  int    `json:"turn"`
 }
 
 func main() {

@@ -1,9 +1,7 @@
-// Scenario 20: Fast Repetitive Intermittent Network Drops (Flapping Connection)
+// Scenario 20: Repeated Capture/Recall Stability
 //
-// Simulates a gateway that alternates between healthy responses and total
-// connection drops on every other call. Verifies that the adapter processes
-// successful calls normally and queues missed events in the fallback buffer,
-// without panicking or blocking.
+// Exercises repeated local Capture/Recall cycles and verifies they complete
+// without errors or panics across multiple turns.
 //
 // Usage:
 //
@@ -12,13 +10,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"sync/atomic"
+	"path/filepath"
 
+	"github.com/firebase/genkit/go/core/x/session"
 	memstore "github.com/leowmjw/go-genkit-memory/memory"
 	sqlitestore "github.com/leowmjw/go-genkit-memory/session/sqlite"
 )
@@ -29,36 +25,16 @@ type FlappingState struct {
 
 func main() {
 	if os.Getenv("INTEGRATION_LIVE") != "1" {
-		fmt.Println("SKIP: set INTEGRATION_LIVE=1 to run (requires gateway + LLM)")
+		fmt.Println("SKIP: set INTEGRATION_LIVE=1 to run")
 		os.Exit(0)
 	}
 
 	ctx := context.Background()
-
-	// Flapping gateway: succeeds on even calls, drops on odd calls.
-	var callCount atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := callCount.Add(1)
-		if n%2 == 0 {
-			// Healthy response.
-			if r.URL.Path == "/recall" {
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]string{"context": ""})
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		// Drop the connection.
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
-			return
-		}
-		conn, _, _ := hj.Hijack()
-		conn.Close()
-	}))
-	defer srv.Close()
+	dataDir := filepath.Join("examples", "scenario20_flapping", ".memory")
+	if err := os.RemoveAll(dataDir); err != nil {
+		fail("reset data dir: %v", err)
+	}
+	defer os.RemoveAll(dataDir)
 
 	store, err := sqlitestore.NewStore[FlappingState](ctx, ":memory:")
 	if err != nil {
@@ -66,35 +42,58 @@ func main() {
 	}
 	defer store.Close()
 
+	cfg := memstore.DefaultPipelineConfig()
+	cfg.DataDir = dataDir
+	cfg.L1TriggerAfterTurns = 1000
+
+	memStore := memstore.NewInMemoryStore()
 	adapter := memstore.NewAdapter[FlappingState](store,
-		memstore.WithGatewayURL(srv.URL),
+		memstore.WithPipelineConfig(cfg),
+		memstore.WithMemoryStore(memStore),
 	)
 	defer adapter.Close()
 
+	sess, err := session.New(ctx,
+		session.WithID[FlappingState]("flapping-session"),
+		session.WithInitialState(FlappingState{}),
+		session.WithStore[FlappingState](adapter),
+	)
+	if err != nil {
+		fail("create session: %v", err)
+	}
+
 	const turns = 10
-	var successCaptures, failedCaptures int
 
 	for i := range turns {
-		// Recall before each turn (alternates success/drop too).
-		_, _ = adapter.Recall(ctx, "flapping-session",
-			fmt.Sprintf("context for turn %d", i+1))
+		recalled, err := adapter.Recall(ctx, "flapping-session", "")
+		if err != nil {
+			fail("turn %d: Recall returned error: %v", i+1, err)
+		}
+		if recalled != "" {
+			fail("turn %d: expected empty recall context, got %q", i+1, recalled)
+		}
 
 		if err := adapter.Capture(ctx, "flapping-session",
 			fmt.Sprintf("Turn %d user message", i+1),
 			fmt.Sprintf("Turn %d assistant reply", i+1)); err != nil {
-			failedCaptures++
-		} else {
-			successCaptures++
+			fail("turn %d: Capture returned error: %v", i+1, err)
+		}
+
+		state := sess.State()
+		state.Turn = i + 1
+		if err := sess.UpdateState(ctx, state); err != nil {
+			fail("turn %d: UpdateState failed: %v", i+1, err)
 		}
 	}
 
-	// Wait a moment for async captures to settle.
-	adapter.Close()
+	if sess.State().Turn != turns {
+		fail("expected final turn %d, got %d", turns, sess.State().Turn)
+	}
+	if buffered := adapter.FallbackLen(); buffered != 0 {
+		fail("expected no fallback buffering, got %d entries", buffered)
+	}
 
-	buffered := adapter.FallbackLen()
-	fmt.Printf("PASS: %d turns — %d captures queued, %d fallback buffer entries\n",
-		turns, successCaptures+failedCaptures, buffered)
-	fmt.Printf("  (flapping gateway: some captures succeed, others go to fallback — no panics)\n")
+	fmt.Printf("PASS: %d local Capture/Recall cycles completed without errors\n", turns)
 }
 
 func fail(format string, args ...any) {
