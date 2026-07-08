@@ -17,14 +17,15 @@ All local tooling is managed through **[mise](https://mise.jdx.dev/)**.
 Configuration lives in `mise.toml` at the repository root.
 
 ```
-mise install          # install all declared tool versions (go, node)
-mise run install      # install Go tools (air) + TencentDB gateway (npm)
-mise run tencentdb:install  # install TencentDB gateway only
+mise install          # install all declared tool versions (go)
+mise run install      # install Go tools (air, copilot-proxy-go)
+mise run setup        # first-time setup (install + TLS + doctor)
 mise run doctor       # verify all runtime dependencies (see §1.4)
-mise run dev          # start the app via Overmind in dev mode (app + tencentdb)
+mise run dev          # start the app via Overmind in dev mode (app + copilot-proxy-go)
 mise run test         # run unit tests only (no external deps)
 mise run test:int     # run integration tests (no external deps)
 mise run build        # compile the binary
+mise run refresh-local-tls-ca-bundle  # refresh enterprise TLS CA bundle
 ```
 
 ### 1.2 Local process management — Overmind + Procfile
@@ -56,14 +57,17 @@ Checks performed (in order):
 | `air` | latest | `mise run install` |
 | `tmux` | any | system package manager |
 | `overmind` | latest | `brew install overmind` / `go install github.com/DarthSim/overmind/v2@latest` |
-| `node` | 22.16 | `mise install` (declared in `[tools]`) |
-| `npm` | ships with node | `mise install` |
-| TencentDB gateway plugin dir | `~/.memory-tencentdb/tdai-memory-openclaw-plugin` | `mise run tencentdb:install` |
-| TencentDB gateway daemon | reachable at `$MEMORY_TENCENTDB_GATEWAY_HOST:$MEMORY_TENCENTDB_GATEWAY_PORT` | `mise run dev` or `mise run tencentdb:start` |
-| OpenAI-compatible endpoint | reachable at `$OPENAI_BASE_URL` | start Ollama or compatible server |
+| `copilot-proxy-go` | latest | `mise run install` |
+| LLM endpoint | reachable at `$LLM_BASE_URL` | `mise run dev` (copilot-proxy-go) or local LLM |
+| Enterprise TLS CA bundle | optional | `mise run refresh-local-tls-ca-bundle` |
 
 The doctor task exits **0** only when all checks pass.  Each failing check
 prints a one-line remediation hint (never just an error code).
+
+### 1.5 First-time setup (`mise run setup`)
+
+Run `mise run setup` on a fresh clone.  It installs tool versions, dev tools,
+refreshes the enterprise TLS CA bundle (if applicable), and runs `mise run doctor`.
 
 ---
 
@@ -74,19 +78,27 @@ All environment configuration is declared in `mise.toml` under `[env]`.
 
 | Variable | Default in mise.toml | Purpose |
 |---|---|---|
-| `OPENAI_BASE_URL` | `http://aibox:11435/v1` | OpenAI-compatible API base URL (Go app) |
-| `OPENAI_API_KEY` | `local` | API key (arbitrary value for local servers) |
-| `OPENAI_MODEL` | `gpt-oss-20b-Q8_0` | Default model name |
+| `LLM_BASE_URL` | `http://127.0.0.1:4141/v1` | LLM proxy base URL (copilot-proxy-go) |
+| `LLM_API_KEY` | `copilot` | API key for copilot-proxy-go |
+| `LLM_MODEL` | `gpt-5.5-mini` | Default model (execution tasks) |
+| `LLM_MODEL_HEAVY` | `gpt-5.5` | Heavy model (analysis + planning) |
+| `OPENAI_BASE_URL` | (mirrors `LLM_BASE_URL`) | OpenAI-compatible API base URL (Go app) |
+| `OPENAI_API_KEY` | (mirrors `LLM_API_KEY`) | API key consumed by GenKit |
+| `OPENAI_MODEL` | (mirrors `LLM_MODEL`) | Default model name consumed by GenKit |
 | `APP_ENV` | `development` | Runtime environment tag |
 | `LOG_LEVEL` | `debug` | Structured log verbosity |
-| `MEMORY_TENCENTDB_GATEWAY_HOST` | `127.0.0.1` | TencentDB gateway host |
-| `MEMORY_TENCENTDB_GATEWAY_PORT` | `8420` | TencentDB gateway port |
-| `MEMORY_TENCENTDB_LLM_API_KEY` | `local` | API key forwarded to the gateway sidecar |
-| `MEMORY_TENCENTDB_LLM_BASE_URL` | `http://aibox:11435/v1` | LLM base URL forwarded to the gateway sidecar |
-| `MEMORY_TENCENTDB_LLM_MODEL` | `gpt-oss-20b-Q8_0` | Model forwarded to the gateway sidecar |
 
 Override any variable in a `.env` file (`.gitignore`d) or via `mise.local.toml`
 for machine-specific values.
+
+**To use a local LLM instead of Copilot Business**, override in `mise.local.toml`:
+
+```toml
+[env]
+LLM_BASE_URL = "http://localhost:11434/v1"
+LLM_API_KEY  = "local"
+LLM_MODEL    = "llama3"
+```
 
 ---
 
@@ -267,12 +279,28 @@ unless the repository ships a runnable binary; in that case use `cmd/<name>/main
 
 ## 8. AI / LLM Integration
 
+### 8.1 LLM proxy — copilot-proxy-go
+
+- **Default provider**: Copilot Business LLM via `copilot-proxy-go` at `127.0.0.1:4141`.
+- **Models**: `gpt-5.5-mini` (execution tasks), `gpt-5.5` (analysis + planning).
+- The proxy is started automatically by `mise run dev` (Overmind Procfile).
+- **Alternative**: Override `LLM_BASE_URL` in `mise.local.toml` to point to any
+  OpenAI-compatible endpoint (e.g., Ollama, vLLM, or a remote API).
+
+### 8.2 Go integration
+
 - The genkit `ai.DefineModel` or `openai.New` call must read base URL and model
   from `os.Getenv("OPENAI_BASE_URL")` and `os.Getenv("OPENAI_MODEL")`.
 - The client must set a `timeout` (30 s default) on the underlying
   `*http.Client` — never use the default zero-timeout client.
 - Log every outbound LLM call at `DEBUG` level with model, prompt token count
   (if available), and latency.
+
+### 8.3 Enterprise TLS
+
+- On enterprise networks, `cache/LOCAL_TLS/ca-bundle.crt` provides the CA chain.
+- Refresh with `mise run refresh-local-tls-ca-bundle`.
+- Set `NODE_EXTRA_CA_CERTS=cache/LOCAL_TLS/ca-bundle.crt` if Node tooling needs it.
 
 ---
 
@@ -285,7 +313,7 @@ unless the repository ships a runnable binary; in that case use `cmd/<name>/main
 - [ ] Every new exported symbol has a Go doc comment.
 - [ ] `.env` / secrets are not committed (scan with `mise run secret-scan`).
 
-NOTE: Check the TencentDB is started to run via Overmind + Procfile too 
+NOTE: Ensure copilot-proxy-go is started via Overmind + Procfile for LLM access.
 
 Evaluation of correctness should be designed to fit and pass all the scenarios in SCENARIO.md; ensure the examples created in the folder examples natch this, the result should be mostly deterministic and be accurate. Ask if not clear.
 

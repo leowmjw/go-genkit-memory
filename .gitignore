@@ -46,6 +46,9 @@ tmp/
 # Ignore Direnv
 .envrc*
 
+# Local TLS CA bundle cache (enterprise networks)
+cache/
+
 node_modules
 
 # Guard against accidental npm runs in the workspace root
